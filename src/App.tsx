@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 
 const USERS = ['张天皓', '王星宇', '洛松江村'];
 
@@ -9,6 +9,18 @@ const BMOB_HEADERS = {
   "X-Bmob-Application-Id": BMOB_APP_ID,
   "X-Bmob-REST-API-Key": BMOB_REST_KEY,
   "Content-Type": "application/json"
+};
+
+// localStorage 兜底存储（确保数据不丢失）
+const STORAGE_KEY = 'booking_system_data';
+const loadLocalData = (): Record<string, string> => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch { return {}; }
+};
+const saveLocalData = (data: Record<string, string>) => {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
 };
 
 const TIME_SLOTS = Array.from({ length: 12 }).map((_, i) => {
@@ -90,8 +102,6 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState('');
   const [objectId, setObjectId] = useState<string | null>(null);
 
-  const isOffline = useRef(false);
-
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [aiModal, setAiModal] = useState<{ isOpen: boolean, title: string, content: string }>({ isOpen: false, title: '', content: '' });
   const [conflictModal, setConflictModal] = useState<{ isOpen: boolean, dateId: string, slotId: string, reserver: string }>({ isOpen: false, dateId: '', slotId: '', reserver: '' });
@@ -101,56 +111,72 @@ export default function App() {
     setTimeout(() => setToastMessage(''), 3000);
   };
 
-  // 获取云端数据
-  const fetchReservations = async () => {
-    if (isOffline.current) return;
-
+  // 尝试从 Bmob 云端拉取数据（失败不影响本地使用）
+  const fetchFromCloud = async () => {
     try {
       const res = await fetch("https://api.bmob.cn/1/classes/SharedSchedule?limit=1", { headers: BMOB_HEADERS });
-      if (!res.ok) {
-         throw new Error(`HTTP Error: ${res.status}`);
-      }
-
+      if (!res.ok) return null;
       const data = await res.json();
       if (data.results && data.results.length > 0) {
-        setReservations(data.results[0].data || {});
         setObjectId(data.results[0].objectId);
+        return data.results[0].data || {};
       } else {
         const createRes = await fetch("https://api.bmob.cn/1/classes/SharedSchedule", {
           method: "POST",
           headers: BMOB_HEADERS,
-          body: JSON.stringify({ data: {} })
+          body: JSON.stringify({ data: loadLocalData() })
         });
         const createData = await createRes.json();
         setObjectId(createData.objectId);
+        return null;
       }
-    } catch (e) {
-      if (!isOffline.current) {
-        isOffline.current = true;
-        showToast("由于沙盒环境限制，已为您平滑切换至本地预览模式");
-      }
-    }
+    } catch { return null; }
   };
 
-  // 推送数据到云端
+  // 推送数据到 Bmob 云端（失败不影响本地使用）
   const syncToCloud = async (newData: Record<string, string>, currentObjectId: string | null) => {
-    if (!currentObjectId || isOffline.current) return;
+    if (!currentObjectId) return;
     try {
-      const res = await fetch(`https://api.bmob.cn/1/classes/SharedSchedule/${currentObjectId}`, {
+      await fetch(`https://api.bmob.cn/1/classes/SharedSchedule/${currentObjectId}`, {
         method: "PUT",
         headers: BMOB_HEADERS,
         body: JSON.stringify({ data: newData })
       });
-      if (!res.ok) throw new Error('Sync failed');
-    } catch (e) {
-      // 静默处理，不中断本地操作
-    }
+    } catch { /* 云端同步失败，本地数据不受影响 */ }
   };
 
+  // 初始化：先加载本地数据（秒开），再尝试云端同步
   useEffect(() => {
     setDates(generateDates());
-    fetchReservations();
-    const interval = setInterval(fetchReservations, 5000);
+
+    // 1. 先从 localStorage 加载（立即可用）
+    const localData = loadLocalData();
+    if (Object.keys(localData).length > 0) {
+      setReservations(localData);
+    }
+
+    // 2. 再尝试从 Bmob 云端拉取（后台静默进行）
+    fetchFromCloud().then(cloudData => {
+      if (cloudData && Object.keys(cloudData).length > 0) {
+        // 云端有数据，优先用云端的（合并覆盖本地）
+        setReservations(cloudData);
+        saveLocalData(cloudData);
+      }
+    });
+
+    // 3. 定时同步（每10秒从云端拉取）
+    const interval = setInterval(() => {
+      fetchFromCloud().then(cloudData => {
+        if (cloudData) {
+          setReservations(prev => {
+            // 合并云端数据（云端优先）
+            const merged = { ...prev, ...cloudData };
+            saveLocalData(merged);
+            return merged;
+          });
+        }
+      });
+    }, 10000);
     return () => clearInterval(interval);
   }, []);
 
@@ -159,11 +185,14 @@ export default function App() {
     const currentReserver = reservations[key];
 
     if (currentReserver === currentUser) {
+      // 取消预约
       const newReservations = { ...reservations };
       delete newReservations[key];
       setReservations(newReservations);
-      syncToCloud(newReservations, objectId);
+      saveLocalData(newReservations);   // ✅ 立即存本地
+      syncToCloud(newReservations, objectId);  // 后台同步云端
     } else if (!currentReserver) {
+      // 新增预约
       const userSlotsOnDate = Object.entries(reservations).filter(
         ([k, v]) => k.startsWith(`${dateId}-`) && v === currentUser
       ).length;
@@ -175,8 +204,10 @@ export default function App() {
 
       const newReservations = { ...reservations, [key]: currentUser };
       setReservations(newReservations);
-      syncToCloud(newReservations, objectId);
+      saveLocalData(newReservations);   // ✅ 立即存本地
+      syncToCloud(newReservations, objectId);  // 后台同步云端
     } else {
+      // 冲突：已被别人预约
       setConflictModal({ isOpen: true, dateId, slotId, reserver: currentReserver });
     }
   };
